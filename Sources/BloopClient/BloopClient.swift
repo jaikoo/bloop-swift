@@ -23,6 +23,7 @@ public final class BloopClient {
     }())
 
     private var buffer: [ErrorEvent] = []
+    private var traceBuffer: [[String: Any]] = []
     private let bufferLock = NSLock()
     private let maxBufferSize: Int
     private let flushInterval: TimeInterval
@@ -196,8 +197,10 @@ public final class BloopClient {
         buffer.removeAll()
         bufferLock.unlock()
 
-        guard !events.isEmpty else { return }
-        sendBatch(events)
+        if !events.isEmpty {
+            sendBatch(events)
+        }
+        flushTraces()
     }
 
     /// Flush buffered events synchronously. Use in crash handlers and app termination
@@ -209,8 +212,10 @@ public final class BloopClient {
         buffer.removeAll()
         bufferLock.unlock()
 
-        guard !events.isEmpty else { return }
-        sendBatchSync(events)
+        if !events.isEmpty {
+            sendBatchSync(events)
+        }
+        flushTracesSync()
     }
 
     /// Invalidate the flush timer, flush remaining events synchronously, and clean up lifecycle observers.
@@ -222,6 +227,29 @@ public final class BloopClient {
         }
         lifecycleObservers.removeAll()
         flushSync()
+    }
+
+    // MARK: - Tracing
+
+    /// Start a new LLM trace.
+    public func startTrace(
+        name: String, sessionId: String? = nil, userId: String? = nil,
+        input: String? = nil, metadata: [String: Any]? = nil,
+        promptName: String? = nil, promptVersion: String? = nil
+    ) -> LLMTrace {
+        return LLMTrace(client: self, name: name, sessionId: sessionId,
+                        userId: userId, input: input, metadata: metadata,
+                        promptName: promptName, promptVersion: promptVersion)
+    }
+
+    internal func enqueueTrace(_ trace: LLMTrace) {
+        bufferLock.lock()
+        traceBuffer.append(trace.toDictionary())
+        let shouldFlush = traceBuffer.count >= maxBufferSize
+        bufferLock.unlock()
+        if shouldFlush {
+            flushTraces()
+        }
     }
 
     // MARK: - Device Info
@@ -327,6 +355,56 @@ public final class BloopClient {
         session.dataTask(with: request) { _, _, _ in
             semaphore.signal()
         }.resume()
+        _ = semaphore.wait(timeout: .now() + 3.0)
+    }
+
+    private func flushTraces() {
+        bufferLock.lock()
+        let traces = traceBuffer
+        traceBuffer.removeAll()
+        bufferLock.unlock()
+        guard !traces.isEmpty else { return }
+        sendTraces(traces)
+    }
+
+    private func flushTracesSync() {
+        bufferLock.lock()
+        let traces = traceBuffer
+        traceBuffer.removeAll()
+        bufferLock.unlock()
+        guard !traces.isEmpty else { return }
+        sendTracesSync(traces)
+    }
+
+    private func sendTraces(_ traces: [[String: Any]]) {
+        let payload: [String: Any] = ["traces": traces]
+        guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        let signature = hmacSHA256(data: body, key: secret)
+
+        var request = URLRequest(url: endpoint.appendingPathComponent("/v1/traces/batch"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(signature, forHTTPHeaderField: "X-Signature")
+        if let projectKey { request.setValue(projectKey, forHTTPHeaderField: "X-Project-Key") }
+        request.httpBody = body
+
+        session.dataTask(with: request) { _, _, _ in }.resume()
+    }
+
+    private func sendTracesSync(_ traces: [[String: Any]]) {
+        let payload: [String: Any] = ["traces": traces]
+        guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        let signature = hmacSHA256(data: body, key: secret)
+
+        var request = URLRequest(url: endpoint.appendingPathComponent("/v1/traces/batch"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(signature, forHTTPHeaderField: "X-Signature")
+        if let projectKey { request.setValue(projectKey, forHTTPHeaderField: "X-Project-Key") }
+        request.httpBody = body
+
+        let semaphore = DispatchSemaphore(value: 0)
+        session.dataTask(with: request) { _, _, _ in semaphore.signal() }.resume()
         _ = semaphore.wait(timeout: .now() + 3.0)
     }
 

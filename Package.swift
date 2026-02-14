@@ -21,5 +21,10 @@ let package = Package(
             name: "BloopClient",
             path: "Sources/BloopClient"
         ),
+        .testTarget(
+            name: "BloopClientTests",
+            dependencies: ["BloopClient"],
+            path: "Tests/BloopClientTests"
+        ),
     ]
 )
